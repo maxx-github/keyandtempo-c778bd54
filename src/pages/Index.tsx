@@ -1,27 +1,56 @@
 import { useState } from "react";
 import { motion } from "framer-motion";
 import { Disc3 } from "lucide-react";
+import { toast } from "sonner";
 import heroBg from "@/assets/hero-bg.jpg";
 import AudioUpload from "@/components/AudioUpload";
 import AnalysisResults from "@/components/AnalysisResults";
 import StemPlayer from "@/components/StemPlayer";
 import WaveformVisualizer from "@/components/WaveformVisualizer";
 
-// Simulated analysis for UI demo — real backend will replace this
-const simulateAnalysis = (): Promise<{ key: string; tempo: number; confidence: number }> =>
-  new Promise((resolve) =>
-    setTimeout(
-      () =>
-        resolve({
-          key: ["C Major", "A Minor", "G Major", "E Minor", "D Major", "F Major"][
-            Math.floor(Math.random() * 6)
-          ],
-          tempo: Math.floor(Math.random() * 80) + 80,
-          confidence: Math.floor(Math.random() * 15) + 85,
-        }),
-      3000
-    )
-  );
+const ANALYZE_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/analyze-audio`;
+
+const fileToBase64 = (file: File): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result as string;
+      // Strip the data URL prefix to get raw base64
+      resolve(result.split(",")[1]);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+
+const analyzeAudio = async (file: File): Promise<{ key: string; tempo: number; confidence: number }> => {
+  // Limit to ~10MB for the API call
+  const maxSize = 10 * 1024 * 1024;
+  if (file.size > maxSize) {
+    throw new Error("File too large. Please use a file under 10MB.");
+  }
+
+  const audioBase64 = await fileToBase64(file);
+
+  const resp = await fetch(ANALYZE_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+    },
+    body: JSON.stringify({
+      audioBase64,
+      mimeType: file.type,
+      fileName: file.name,
+    }),
+  });
+
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({ error: "Analysis failed" }));
+    throw new Error(err.error || "Analysis failed");
+  }
+
+  return resp.json();
+};
 
 const Index = () => {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -43,14 +72,15 @@ const Index = () => {
     setIsAnalyzing(true);
 
     try {
-      const analysisResults = await simulateAnalysis();
+      const analysisResults = await analyzeAudio(file);
       setResults(analysisResults);
 
-      // Simulate stem URLs (will be replaced by real backend)
+      // Stem separation placeholder (will be replaced by real backend)
       const objectUrl = URL.createObjectURL(file);
       setStems({ vocals: objectUrl, instrumental: objectUrl });
     } catch (error) {
       console.error("Analysis failed:", error);
+      toast.error(error instanceof Error ? error.message : "Analysis failed. Please try again.");
     } finally {
       setIsAnalyzing(false);
     }
