@@ -7,15 +7,16 @@ import AudioUpload from "@/components/AudioUpload";
 import AnalysisResults from "@/components/AnalysisResults";
 import StemPlayer from "@/components/StemPlayer";
 import WaveformVisualizer from "@/components/WaveformVisualizer";
+import { supabase } from "@/integrations/supabase/client";
 
 const ANALYZE_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/analyze-audio`;
+const STEMS_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/separate-stems`;
 
 const fileToBase64 = (file: File): Promise<string> =>
   new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {
       const result = reader.result as string;
-      // Strip the data URL prefix to get raw base64
       resolve(result.split(",")[1]);
     };
     reader.onerror = reject;
@@ -23,7 +24,6 @@ const fileToBase64 = (file: File): Promise<string> =>
   });
 
 const analyzeAudio = async (file: File): Promise<{ key: string; tempo: number; confidence: number }> => {
-  // Limit to ~10MB for the API call
   const maxSize = 10 * 1024 * 1024;
   if (file.size > maxSize) {
     throw new Error("File too large. Please use a file under 10MB.");
@@ -37,11 +37,7 @@ const analyzeAudio = async (file: File): Promise<{ key: string; tempo: number; c
       "Content-Type": "application/json",
       Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
     },
-    body: JSON.stringify({
-      audioBase64,
-      mimeType: file.type,
-      fileName: file.name,
-    }),
+    body: JSON.stringify({ audioBase64, mimeType: file.type, fileName: file.name }),
   });
 
   if (!resp.ok) {
@@ -52,9 +48,75 @@ const analyzeAudio = async (file: File): Promise<{ key: string; tempo: number; c
   return resp.json();
 };
 
+const uploadAudioToStorage = async (file: File): Promise<string> => {
+  const fileName = `${crypto.randomUUID()}-${file.name}`;
+  const { error } = await supabase.storage
+    .from("audio-uploads")
+    .upload(fileName, file, { contentType: file.type });
+
+  if (error) throw new Error("Failed to upload audio file");
+
+  const { data } = supabase.storage.from("audio-uploads").getPublicUrl(fileName);
+  return data.publicUrl;
+};
+
+const pollPrediction = async (predictionId: string): Promise<{ vocals: string; instrumental: string }> => {
+  const maxAttempts = 120; // 10 minutes max
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise((r) => setTimeout(r, 5000));
+
+    const resp = await fetch(STEMS_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+      },
+      body: JSON.stringify({ action: "poll", predictionId }),
+    });
+
+    if (!resp.ok) throw new Error("Failed to check separation status");
+
+    const prediction = await resp.json();
+
+    if (prediction.status === "succeeded") {
+      // Demucs htdemucs model returns an object with stem URLs
+      const output = prediction.output;
+      return {
+        vocals: typeof output === "string" ? output : output?.vocals || output,
+        instrumental: typeof output === "string" ? output : output?.other || output?.accompaniment || output,
+      };
+    }
+
+    if (prediction.status === "failed" || prediction.status === "canceled") {
+      throw new Error(prediction.error || "Stem separation failed");
+    }
+  }
+  throw new Error("Stem separation timed out");
+};
+
+const separateStems = async (audioUrl: string): Promise<{ vocals: string; instrumental: string }> => {
+  const resp = await fetch(STEMS_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+    },
+    body: JSON.stringify({ audioUrl }),
+  });
+
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({ error: "Separation failed" }));
+    throw new Error(err.error || "Separation failed");
+  }
+
+  const prediction = await resp.json();
+  return pollPrediction(prediction.id);
+};
+
 const Index = () => {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [isSeparating, setIsSeparating] = useState(false);
   const [results, setResults] = useState<{
     key: string;
     tempo: number;
@@ -70,19 +132,29 @@ const Index = () => {
     setResults(null);
     setStems(null);
     setIsAnalyzing(true);
+    setIsSeparating(false);
 
     try {
-      const analysisResults = await analyzeAudio(file);
+      // Run analysis and upload in parallel
+      const [analysisResults, audioUrl] = await Promise.all([
+        analyzeAudio(file),
+        uploadAudioToStorage(file),
+      ]);
       setResults(analysisResults);
+      setIsAnalyzing(false);
 
-      // Stem separation placeholder (will be replaced by real backend)
-      const objectUrl = URL.createObjectURL(file);
-      setStems({ vocals: objectUrl, instrumental: objectUrl });
+      // Start stem separation
+      setIsSeparating(true);
+      toast.info("Starting stem separation… this may take a few minutes.");
+      const stemResults = await separateStems(audioUrl);
+      setStems(stemResults);
+      toast.success("Stem separation complete!");
     } catch (error) {
-      console.error("Analysis failed:", error);
-      toast.error(error instanceof Error ? error.message : "Analysis failed. Please try again.");
+      console.error("Processing failed:", error);
+      toast.error(error instanceof Error ? error.message : "Processing failed. Please try again.");
     } finally {
       setIsAnalyzing(false);
+      setIsSeparating(false);
     }
   };
 
@@ -160,6 +232,11 @@ const Index = () => {
                 {isAnalyzing && (
                   <span className="text-xs font-mono text-primary animate-pulse-glow">
                     Analyzing...
+                  </span>
+                )}
+                {!isAnalyzing && isSeparating && (
+                  <span className="text-xs font-mono text-primary animate-pulse-glow">
+                    Separating stems...
                   </span>
                 )}
               </div>
