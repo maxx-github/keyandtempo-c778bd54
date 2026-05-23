@@ -62,29 +62,48 @@ const uploadAudioToStorage = async (file: File): Promise<string> => {
 
 const pollPrediction = async (predictionId: string): Promise<{ vocals: string; instrumental: string }> => {
   const maxAttempts = 120; // 10 minutes max
+  let consecutiveErrors = 0;
+
   for (let i = 0; i < maxAttempts; i++) {
     await new Promise((r) => setTimeout(r, 5000));
 
-    const resp = await fetch(STEMS_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
-      },
-      body: JSON.stringify({ action: "poll", predictionId }),
-    });
+    let resp: Response;
+    try {
+      resp = await fetch(STEMS_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+        },
+        body: JSON.stringify({ action: "poll", predictionId }),
+      });
+    } catch {
+      consecutiveErrors++;
+      if (consecutiveErrors >= 5) throw new Error("Lost connection while checking separation status");
+      continue;
+    }
 
-    if (!resp.ok) throw new Error("Failed to check separation status");
+    if (!resp.ok) {
+      consecutiveErrors++;
+      if (consecutiveErrors >= 5) throw new Error("Failed to check separation status");
+      continue;
+    }
+    consecutiveErrors = 0;
 
     const prediction = await resp.json();
 
     if (prediction.status === "succeeded") {
-      // Demucs htdemucs model returns an object with stem URLs
       const output = prediction.output;
-      return {
-        vocals: typeof output === "string" ? output : output?.vocals || output,
-        instrumental: typeof output === "string" ? output : output?.other || output?.accompaniment || output,
-      };
+      // Demucs (ryan5453) with stem="vocals" returns { vocals, other }
+      const vocals = typeof output === "string" ? output : output?.vocals;
+      const instrumental = typeof output === "string"
+        ? output
+        : output?.other ?? output?.no_vocals ?? output?.accompaniment ?? output?.instrumental;
+
+      if (!vocals || !instrumental) {
+        throw new Error("Separation finished but stem URLs were missing");
+      }
+      return { vocals, instrumental };
     }
 
     if (prediction.status === "failed" || prediction.status === "canceled") {
