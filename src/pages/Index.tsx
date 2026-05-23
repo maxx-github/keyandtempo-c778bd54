@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { motion } from "framer-motion";
-import { Disc3 } from "lucide-react";
+import { Disc3, Sparkles, Layers } from "lucide-react";
 import { toast } from "sonner";
 import heroBg from "@/assets/hero-bg.jpg";
 import AudioUpload from "@/components/AudioUpload";
@@ -8,65 +8,27 @@ import AnalysisResults from "@/components/AnalysisResults";
 import StemPlayer from "@/components/StemPlayer";
 import WaveformVisualizer from "@/components/WaveformVisualizer";
 import { supabase } from "@/integrations/supabase/client";
+import { analyzeAudioFile } from "@/lib/audioAnalysis";
 
-const ANALYZE_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/analyze-audio`;
 const STEMS_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/separate-stems`;
-
-const fileToBase64 = (file: File): Promise<string> =>
-  new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result as string;
-      resolve(result.split(",")[1]);
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-
-const analyzeAudio = async (file: File): Promise<{ key: string; tempo: number; confidence: number }> => {
-  const maxSize = 10 * 1024 * 1024;
-  if (file.size > maxSize) {
-    throw new Error("File too large. Please use a file under 10MB.");
-  }
-
-  const audioBase64 = await fileToBase64(file);
-
-  const resp = await fetch(ANALYZE_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
-    },
-    body: JSON.stringify({ audioBase64, mimeType: file.type, fileName: file.name }),
-  });
-
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({ error: "Analysis failed" }));
-    throw new Error(err.error || "Analysis failed");
-  }
-
-  return resp.json();
-};
 
 const uploadAudioToStorage = async (file: File): Promise<string> => {
   const fileName = `${crypto.randomUUID()}-${file.name}`;
   const { error } = await supabase.storage
     .from("audio-uploads")
     .upload(fileName, file, { contentType: file.type });
-
   if (error) throw new Error("Failed to upload audio file");
-
   const { data } = supabase.storage.from("audio-uploads").getPublicUrl(fileName);
   return data.publicUrl;
 };
 
-const pollPrediction = async (predictionId: string): Promise<{ vocals: string; instrumental: string }> => {
-  const maxAttempts = 120; // 10 minutes max
+const pollPrediction = async (
+  predictionId: string
+): Promise<{ vocals: string; instrumental: string }> => {
+  const maxAttempts = 120;
   let consecutiveErrors = 0;
-
   for (let i = 0; i < maxAttempts; i++) {
     await new Promise((r) => setTimeout(r, 5000));
-
     let resp: Response;
     try {
       resp = await fetch(STEMS_URL, {
@@ -82,30 +44,23 @@ const pollPrediction = async (predictionId: string): Promise<{ vocals: string; i
       if (consecutiveErrors >= 5) throw new Error("Lost connection while checking separation status");
       continue;
     }
-
     if (!resp.ok) {
       consecutiveErrors++;
       if (consecutiveErrors >= 5) throw new Error("Failed to check separation status");
       continue;
     }
     consecutiveErrors = 0;
-
     const prediction = await resp.json();
-
     if (prediction.status === "succeeded") {
       const output = prediction.output;
-      // Demucs (ryan5453) with stem="vocals" returns { vocals, other }
       const vocals = typeof output === "string" ? output : output?.vocals;
-      const instrumental = typeof output === "string"
-        ? output
-        : output?.other ?? output?.no_vocals ?? output?.accompaniment ?? output?.instrumental;
-
-      if (!vocals || !instrumental) {
-        throw new Error("Separation finished but stem URLs were missing");
-      }
+      const instrumental =
+        typeof output === "string"
+          ? output
+          : output?.other ?? output?.no_vocals ?? output?.accompaniment ?? output?.instrumental;
+      if (!vocals || !instrumental) throw new Error("Separation finished but stem URLs were missing");
       return { vocals, instrumental };
     }
-
     if (prediction.status === "failed" || prediction.status === "canceled") {
       throw new Error(prediction.error || "Stem separation failed");
     }
@@ -113,7 +68,7 @@ const pollPrediction = async (predictionId: string): Promise<{ vocals: string; i
   throw new Error("Stem separation timed out");
 };
 
-const separateStems = async (audioUrl: string): Promise<{ vocals: string; instrumental: string }> => {
+const separateStems = async (audioUrl: string) => {
   const resp = await fetch(STEMS_URL, {
     method: "POST",
     headers: {
@@ -122,12 +77,10 @@ const separateStems = async (audioUrl: string): Promise<{ vocals: string; instru
     },
     body: JSON.stringify({ audioUrl }),
   });
-
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({ error: "Separation failed" }));
     throw new Error(err.error || "Separation failed");
   }
-
   const prediction = await resp.json();
   return pollPrediction(prediction.id);
 };
@@ -146,40 +99,50 @@ const Index = () => {
     instrumental: string | null;
   } | null>(null);
 
-  const handleFileSelect = async (file: File) => {
+  const busy = isAnalyzing || isSeparating;
+
+  const handleFileSelect = (file: File) => {
     setSelectedFile(file);
     setResults(null);
     setStems(null);
+  };
+
+  const handleAnalyze = async () => {
+    if (!selectedFile || busy) return;
     setIsAnalyzing(true);
-    setIsSeparating(false);
-
+    setResults(null);
     try {
-      // Run analysis and upload in parallel
-      const [analysisResults, audioUrl] = await Promise.all([
-        analyzeAudio(file),
-        uploadAudioToStorage(file),
-      ]);
-      setResults(analysisResults);
-      setIsAnalyzing(false);
-
-      // Start stem separation
-      setIsSeparating(true);
-      toast.info("Starting stem separation… this may take a few minutes.");
-      const stemResults = await separateStems(audioUrl);
-      setStems(stemResults);
-      toast.success("Stem separation complete!");
-    } catch (error) {
-      console.error("Processing failed:", error);
-      toast.error(error instanceof Error ? error.message : "Processing failed. Please try again.");
+      const res = await analyzeAudioFile(selectedFile);
+      setResults(res);
+      toast.success(`Detected ${res.key} • ${res.tempo} BPM`);
+    } catch (e) {
+      console.error(e);
+      toast.error(e instanceof Error ? e.message : "Analysis failed");
     } finally {
       setIsAnalyzing(false);
+    }
+  };
+
+  const handleSeparate = async () => {
+    if (!selectedFile || busy) return;
+    setIsSeparating(true);
+    setStems(null);
+    try {
+      toast.info("Uploading and starting stem separation…");
+      const url = await uploadAudioToStorage(selectedFile);
+      const stemResults = await separateStems(url);
+      setStems(stemResults);
+      toast.success("Stem separation complete!");
+    } catch (e) {
+      console.error(e);
+      toast.error(e instanceof Error ? e.message : "Separation failed");
+    } finally {
       setIsSeparating(false);
     }
   };
 
   return (
     <div className="min-h-screen gradient-dark">
-      {/* Hero Section */}
       <header className="relative overflow-hidden">
         <div
           className="absolute inset-0 opacity-30"
@@ -198,9 +161,7 @@ const Index = () => {
             className="flex items-center gap-2 mb-8"
           >
             <Disc3 className="w-8 h-8 text-primary animate-pulse-glow" />
-            <span className="text-xl font-bold text-foreground tracking-tight">
-              SonicLens
-            </span>
+            <span className="text-xl font-bold text-foreground tracking-tight">SonicLens</span>
           </motion.div>
 
           <motion.h1
@@ -224,42 +185,56 @@ const Index = () => {
         </div>
       </header>
 
-      {/* Main Content */}
       <main className="container mx-auto px-4 pb-20 -mt-4">
         <div className="max-w-2xl mx-auto space-y-8">
-          <AudioUpload onFileSelect={handleFileSelect} isAnalyzing={isAnalyzing} />
+          <AudioUpload onFileSelect={handleFileSelect} isAnalyzing={busy} />
 
-          {/* File info & waveform */}
           {selectedFile && (
             <motion.div
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
-              className="rounded-2xl bg-card border border-border p-6"
+              className="rounded-2xl bg-card border border-border p-6 space-y-5"
             >
-              <div className="flex items-center gap-3 mb-4">
+              <div className="flex items-center gap-3">
                 <div className="w-10 h-10 rounded-xl gradient-primary flex items-center justify-center">
                   <Disc3 className="w-5 h-5 text-primary-foreground" />
                 </div>
                 <div className="flex-1 min-w-0">
-                  <p className="text-sm font-medium text-foreground truncate">
-                    {selectedFile.name}
-                  </p>
+                  <p className="text-sm font-medium text-foreground truncate">{selectedFile.name}</p>
                   <p className="text-xs text-muted-foreground">
                     {(selectedFile.size / (1024 * 1024)).toFixed(1)} MB
                   </p>
                 </div>
                 {isAnalyzing && (
-                  <span className="text-xs font-mono text-primary animate-pulse-glow">
-                    Analyzing...
-                  </span>
+                  <span className="text-xs font-mono text-primary animate-pulse-glow">Analyzing…</span>
                 )}
-                {!isAnalyzing && isSeparating && (
+                {isSeparating && (
                   <span className="text-xs font-mono text-primary animate-pulse-glow">
-                    Separating stems...
+                    Separating stems…
                   </span>
                 )}
               </div>
-              <WaveformVisualizer isAnalyzing={isAnalyzing} />
+
+              <WaveformVisualizer isAnalyzing={busy} />
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <button
+                  onClick={handleAnalyze}
+                  disabled={busy}
+                  className="flex items-center justify-center gap-2 px-4 py-3 rounded-xl gradient-primary text-primary-foreground font-medium transition-opacity disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Sparkles className="w-4 h-4" />
+                  {isAnalyzing ? "Analyzing…" : "Analyze Key & Tempo"}
+                </button>
+                <button
+                  onClick={handleSeparate}
+                  disabled={busy}
+                  className="flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-secondary text-foreground font-medium border border-border hover:bg-surface transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Layers className="w-4 h-4" />
+                  {isSeparating ? "Separating…" : "Separate Stems"}
+                </button>
+              </div>
             </motion.div>
           )}
 
