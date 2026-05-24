@@ -1,9 +1,17 @@
 import { analyze } from "web-audio-beat-detector";
 
+export interface SegmentResult {
+  key: string;
+  tempo: number;
+}
+
 export interface AnalysisResult {
   key: string;
   tempo: number;
   confidence: number;
+  keyAgreement: number; // 0-100, % of segments agreeing with final key
+  tempoAgreement: number; // 0-100, % of segments within ±2 BPM of final tempo
+  segments: SegmentResult[];
 }
 
 // Krumhansl–Schmuckler key profiles (Temperley revised)
@@ -15,10 +23,8 @@ const MINOR_PROFILE = [
 ];
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
-// In-place radix-2 iterative FFT
 function fft(re: Float64Array, im: Float64Array) {
   const n = re.length;
-  // bit reverse
   for (let i = 1, j = 0; i < n; i++) {
     let bit = n >> 1;
     for (; j & bit; bit >>= 1) j ^= bit;
@@ -76,9 +82,7 @@ function pearsonCorrelation(a: number[], b: number[]) {
   return num / Math.sqrt(da * db || 1e-12);
 }
 
-function detectKey(buffer: AudioBuffer): { key: string; confidence: number } {
-  const sr = buffer.sampleRate;
-  // mixdown to mono
+function toMono(buffer: AudioBuffer): Float32Array {
   const length = buffer.length;
   const mono = new Float32Array(length);
   for (let c = 0; c < buffer.numberOfChannels; c++) {
@@ -86,15 +90,22 @@ function detectKey(buffer: AudioBuffer): { key: string; confidence: number } {
     for (let i = 0; i < length; i++) mono[i] += data[i];
   }
   for (let i = 0; i < length; i++) mono[i] /= buffer.numberOfChannels;
+  return mono;
+}
 
+function detectKeyFromMono(
+  mono: Float32Array,
+  sr: number,
+  startSample: number,
+  endSample: number
+): { key: string; gap: number } {
   const FRAME = 8192;
   const HOP = 4096;
   const chroma = new Array(12).fill(0);
 
-  // Precompute bin -> pitch class mapping (skip very low/high bins)
-  const minFreq = 65; // ~C2
+  const minFreq = 65;
   const maxFreq = 2000;
-  const binMap: Int8Array = new Int8Array(FRAME / 2);
+  const binMap = new Int8Array(FRAME / 2);
   for (let k = 0; k < FRAME / 2; k++) {
     const f = (k * sr) / FRAME;
     if (f < minFreq || f > maxFreq) {
@@ -105,7 +116,6 @@ function detectKey(buffer: AudioBuffer): { key: string; confidence: number } {
     binMap[k] = ((Math.round(midi) % 12) + 12) % 12;
   }
 
-  // Hann window
   const window = new Float64Array(FRAME);
   for (let i = 0; i < FRAME; i++) {
     window[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (FRAME - 1)));
@@ -114,7 +124,7 @@ function detectKey(buffer: AudioBuffer): { key: string; confidence: number } {
   const re = new Float64Array(FRAME);
   const im = new Float64Array(FRAME);
 
-  for (let start = 0; start + FRAME <= length; start += HOP) {
+  for (let start = startSample; start + FRAME <= endSample; start += HOP) {
     for (let i = 0; i < FRAME; i++) {
       re[i] = mono[start + i] * window[i];
       im[i] = 0;
@@ -128,7 +138,6 @@ function detectKey(buffer: AudioBuffer): { key: string; confidence: number } {
     }
   }
 
-  // Normalize
   const sum = chroma.reduce((s, v) => s + v, 0) || 1;
   const norm = chroma.map((v) => v / sum);
 
@@ -153,10 +162,7 @@ function detectKey(buffer: AudioBuffer): { key: string; confidence: number } {
     } else if (sMin > secondScore) secondScore = sMin;
   }
 
-  // Confidence: gap between best and second, mapped to 0-100
-  const gap = Math.max(0, bestScore - secondScore);
-  const confidence = Math.min(99, Math.round(60 + gap * 200));
-  return { key: bestKey, confidence };
+  return { key: bestKey, gap: Math.max(0, bestScore - secondScore) };
 }
 
 async function decodeFile(file: File): Promise<AudioBuffer> {
@@ -172,8 +178,21 @@ async function decodeFile(file: File): Promise<AudioBuffer> {
   }
 }
 
-async function detectTempo(buffer: AudioBuffer): Promise<number> {
-  // web-audio-beat-detector uses an OfflineAudioContext to estimate BPM
+function sliceBuffer(buffer: AudioBuffer, startSample: number, endSample: number): AudioBuffer {
+  const len = endSample - startSample;
+  const Ctx =
+    (window.AudioContext as typeof AudioContext) ||
+    (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+  const ctx = new Ctx();
+  const out = ctx.createBuffer(buffer.numberOfChannels, len, buffer.sampleRate);
+  for (let c = 0; c < buffer.numberOfChannels; c++) {
+    out.copyToChannel(buffer.getChannelData(c).subarray(startSample, endSample), c);
+  }
+  ctx.close();
+  return out;
+}
+
+async function detectTempoSafe(buffer: AudioBuffer): Promise<number> {
   try {
     const bpm = await analyze(buffer);
     return Math.round(bpm);
@@ -182,11 +201,93 @@ async function detectTempo(buffer: AudioBuffer): Promise<number> {
   }
 }
 
+function mode<T>(arr: T[]): { value: T; count: number } {
+  const counts = new Map<T, number>();
+  for (const v of arr) counts.set(v, (counts.get(v) || 0) + 1);
+  let best: T = arr[0];
+  let bestC = 0;
+  for (const [v, c] of counts) {
+    if (c > bestC) {
+      best = v;
+      bestC = c;
+    }
+  }
+  return { value: best, count: bestC };
+}
+
 export async function analyzeAudioFile(file: File): Promise<AnalysisResult> {
   const buffer = await decodeFile(file);
-  const [{ key, confidence }, tempo] = await Promise.all([
-    Promise.resolve(detectKey(buffer)),
-    detectTempo(buffer),
-  ]);
-  return { key, tempo, confidence };
+  const sr = buffer.sampleRate;
+  const total = buffer.length;
+  const duration = total / sr;
+
+  const mono = toMono(buffer);
+
+  // Whole-file detections
+  const fullKey = detectKeyFromMono(mono, sr, 0, total);
+  const fullTempo = await detectTempoSafe(buffer);
+
+  // Segment validation: split into ~4 segments (min 8s each, skip if too short)
+  const segments: SegmentResult[] = [];
+  const segCount = duration >= 32 ? 4 : duration >= 16 ? 2 : 1;
+  if (segCount > 1) {
+    const segLen = Math.floor(total / segCount);
+    const tempoPromises: Promise<number>[] = [];
+    const segKeys: string[] = [];
+    for (let i = 0; i < segCount; i++) {
+      const s = i * segLen;
+      const e = i === segCount - 1 ? total : s + segLen;
+      segKeys.push(detectKeyFromMono(mono, sr, s, e).key);
+      const segBuf = sliceBuffer(buffer, s, e);
+      tempoPromises.push(detectTempoSafe(segBuf));
+    }
+    const segTempos = await Promise.all(tempoPromises);
+    for (let i = 0; i < segCount; i++) {
+      segments.push({ key: segKeys[i], tempo: segTempos[i] });
+    }
+  } else {
+    segments.push({ key: fullKey.key, tempo: fullTempo });
+  }
+
+  // Reconcile key: majority vote across segments + full
+  const allKeys = [fullKey.key, ...segments.map((s) => s.key)];
+  const { value: finalKey, count: keyCount } = mode(allKeys);
+  const keyAgreement = Math.round((keyCount / allKeys.length) * 100);
+
+  // Reconcile tempo: median; handle half/double-time by folding to fullTempo octave
+  const validTempos = [fullTempo, ...segments.map((s) => s.tempo)].filter((t) => t > 0);
+  const folded = validTempos.map((t) => {
+    if (fullTempo <= 0) return t;
+    let f = t;
+    while (f < fullTempo * 0.75) f *= 2;
+    while (f > fullTempo * 1.5) f /= 2;
+    return Math.round(f);
+  });
+  const sorted = [...folded].sort((a, b) => a - b);
+  const finalTempo = sorted.length
+    ? sorted[Math.floor(sorted.length / 2)]
+    : fullTempo;
+  const tempoAgreeCount = folded.filter((t) => Math.abs(t - finalTempo) <= 2).length;
+  const tempoAgreement = folded.length
+    ? Math.round((tempoAgreeCount / folded.length) * 100)
+    : 0;
+
+  // Overall confidence blends key profile gap + segment agreement
+  const gapScore = Math.min(40, fullKey.gap * 120);
+  const confidence = Math.max(
+    30,
+    Math.min(
+      99,
+      Math.round(gapScore + 0.35 * keyAgreement + 0.25 * tempoAgreement)
+    )
+  );
+
+  return {
+    key: finalKey,
+    tempo: finalTempo,
+    confidence,
+    keyAgreement,
+    tempoAgreement,
+    segments,
+  };
 }
