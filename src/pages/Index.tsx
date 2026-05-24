@@ -93,6 +93,9 @@ const Index = () => {
     key: string;
     tempo: number;
     confidence: number;
+    keyAgreement?: number;
+    tempoAgreement?: number;
+    segments?: { key: string; tempo: number }[];
   } | null>(null);
   const [stems, setStems] = useState<{
     vocals: string | null;
