@@ -309,3 +309,7 @@ async function analyzeAudioFileInner(file: File): Promise<AnalysisResult> {
     segments,
   };
 }
+
+export async function analyzeAudioFile(file: File): Promise<AnalysisResult> {
+  return withTimeout(analyzeAudioFileInner(file), 60_000, "Audio analysis");
+}
