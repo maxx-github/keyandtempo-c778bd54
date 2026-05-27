@@ -215,10 +215,28 @@ function mode<T>(arr: T[]): { value: T; count: number } {
   return { value: best, count: bestC };
 }
 
-export async function analyzeAudioFile(file: File): Promise<AnalysisResult> {
+function withTimeout<T>(p: Promise<T>, ms: number, label = "Operation"): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      }
+    );
+  });
+}
+
+async function analyzeAudioFileInner(file: File): Promise<AnalysisResult> {
   const buffer = await decodeFile(file);
   const sr = buffer.sampleRate;
-  const total = buffer.length;
+  // Cap analysis window to first 90s to keep runtime well under 60s
+  const MAX_SECONDS = 90;
+  const total = Math.min(buffer.length, Math.floor(sr * MAX_SECONDS));
   const duration = total / sr;
 
   const mono = toMono(buffer);
