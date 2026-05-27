@@ -241,9 +241,10 @@ async function analyzeAudioFileInner(file: File): Promise<AnalysisResult> {
 
   const mono = toMono(buffer);
 
-  // Whole-file detections
+  // Whole-file detections (capped to MAX_SECONDS)
   const fullKey = detectKeyFromMono(mono, sr, 0, total);
-  const fullTempo = await detectTempoSafe(buffer);
+  const analyzeBuffer = total < buffer.length ? sliceBuffer(buffer, 0, total) : buffer;
+  const fullTempo = await detectTempoSafe(analyzeBuffer);
 
   // Segment validation: split into ~4 segments (min 8s each, skip if too short)
   const segments: SegmentResult[] = [];
